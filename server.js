@@ -5,6 +5,8 @@ const path = require('path');
 const mysql = require('mysql2/promise');
 const fs = require('fs');
 const multer = require('multer');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(cors());
@@ -36,6 +38,8 @@ const dbConfig = {
     port: process.env.DB_PORT || 3306
 };
 
+const JWT_SECRET = process.env.JWT_SECRET || 'panda-secure-key-2026';
+
 let dbPool;
 
 async function initDB() {
@@ -43,7 +47,12 @@ async function initDB() {
     while (!connected) {
         try {
             // الاتصال المبدئي لإنشاء قاعدة البيانات إذا لم تكن موجودة
-            const initialConnection = await mysql.createConnection({ host: dbConfig.host, user: dbConfig.user, password: dbConfig.password, port: dbConfig.port });
+                const initialConnection = await mysql.createConnection({
+                    host: dbConfig.host,
+                    user: dbConfig.user,
+                    password: dbConfig.password,
+                    port: dbConfig.port
+                });
             await initialConnection.query(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\``);
             await initialConnection.end();
 
@@ -65,14 +74,15 @@ async function initDB() {
             // إنشاء مدير افتراضي في حال كانت القاعدة فارغة
             const [adminRows] = await dbPool.query("SELECT * FROM roles WHERE roleCode = 'admin'");
             if (adminRows.length === 0) {
-                await dbPool.query("INSERT INTO roles (email, name, password, role, roleCode, statusCode, date) VALUES ('admin@panda.com', 'مدير النظام', 'admin', 'مدير النظام', 'admin', 'active', '')");
+                const hashedAdminPw = await bcrypt.hash('admin', 10);
+                await dbPool.query("INSERT INTO roles (email, name, password, role, roleCode, statusCode, date) VALUES ('admin@panda.com', 'مدير النظام', ?, 'مدير النظام', 'admin', 'active', '')", [hashedAdminPw]);
                 await dbPool.query("INSERT INTO settings (id, instituteName, currency, maxStudentsPerCourse) VALUES (1, 'مركز الباندا', 'IQD', 30)");
             }
 
-            console.log('Connected to MySQL and Relational Tables initialized successfully. (الجداول العلاقية جاهزة)');
+            console.log("Connected to MySQL successfully ✅ (الجداول العلاقية جاهزة)");
             connected = true;
         } catch (error) {
-            console.error('تعذر الاتصال بقاعدة بيانات MySQL. سيتم إعادة المحاولة بعد 5 ثوانٍ...');
+            console.error("Database connection failed ❌ سيتم إعادة المحاولة بعد 5 ثوانٍ...", error.message);
             // انتظار 5 ثوانٍ قبل محاولة الاتصال مجدداً
             await new Promise(resolve => setTimeout(resolve, 5000));
         }
@@ -134,6 +144,21 @@ async function dbUpsert(table, item) {
 
 // --- مسارات النظام (API Routes) ---
 
+// جدار الحماية (Middleware) لجميع المسارات ما عدا تسجيل الدخول
+app.use('/api', (req, res, next) => {
+    if (req.path === '/login') return next();
+    
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: "Access Denied - يرجى تسجيل الدخول" });
+    
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: "Invalid Token - الجلسة منتهية" });
+        req.user = user;
+        next();
+    });
+});
+
 // مسار رفع الصور الجديد
 app.post('/api/upload', upload.single('image'), (req, res) => {
     if (!req.file) {
@@ -148,12 +173,27 @@ app.post('/api/login', async (req, res) => {
     try {
         const { identifier, password } = req.body;
         const [rows] = await dbPool.query('SELECT * FROM roles WHERE email = ? OR name = ? OR roleCode = ?', [identifier, identifier, identifier]);
-        const user = rows.find(u => u.password === password);
+        const user = rows[0];
         
-        if (user && user.password === password) {
-            const safeUser = { ...user };
-            delete safeUser.password;
-            return res.json({ success: true, user: safeUser });
+        if (user) {
+            let isMatch = false;
+            if (user.password.startsWith('$2b$')) {
+                isMatch = await bcrypt.compare(password, user.password); // مقارنة مشفرة
+            } else {
+                isMatch = (password === user.password); // مقارنة عادية (للحسابات القديمة)
+                if (isMatch) {
+                    // تشفير الكلمة القديمة وحفظها تلقائياً
+                    const hashed = await bcrypt.hash(password, 10);
+                    await dbPool.query('UPDATE roles SET password = ? WHERE email = ?', [hashed, user.email]);
+                }
+            }
+            
+            if (isMatch) {
+                const safeUser = { ...user };
+                delete safeUser.password;
+                const token = jwt.sign({ email: user.email, roleCode: user.roleCode }, JWT_SECRET, { expiresIn: '7d' });
+                return res.json({ success: true, user: safeUser, token });
+            }
         }
         res.status(401).json({ error: "بيانات الدخول غير صحيحة" });
     } catch (error) {
@@ -251,6 +291,10 @@ app.post('/api/roles', async (req, res) => {
         const [existing] = await dbPool.query('SELECT email FROM roles WHERE email = ?', [req.body.email]);
         if (existing.length > 0) return res.status(409).json({ error: "هذا البريد الإلكتروني مستخدم مسبقاً" });
         
+        if (req.body.password) {
+            req.body.password = await bcrypt.hash(req.body.password, 10);
+        }
+        
         await dbUpsert('roles', req.body);
         const [roles] = await dbPool.query('SELECT * FROM roles');
         res.json({ success: true, roles });
@@ -277,7 +321,12 @@ app.put('/api/:collection/:id', async (req, res) => {
         const updates = req.body.student ? req.body.student : req.body;
         
         updates.id = req.params.id;
-        if (col === 'roles') updates.email = req.params.id;
+        if (col === 'roles') {
+            updates.email = req.params.id;
+            if (updates.password && !updates.password.startsWith('$2b$')) {
+                updates.password = await bcrypt.hash(updates.password, 10);
+            }
+        }
         
         await dbUpsert(col, updates);
         
